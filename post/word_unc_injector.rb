@@ -310,7 +310,7 @@ class Metasploit3 < Msf::Post
 				return
 			end
 		elsif not datastore['RMLOCAL']
-			print_status("!!Keeping original of #{datastore['FILE']} in #{datastore['DSTPATH']}")
+			print_warning("\tKeeping original of #{datastore['FILE']} in #{datastore['DSTPATH']}")
 		end
 
 		print_good("File #{datastore['FILE']} succesfully injected to point to #{datastore['LHOST']}")
