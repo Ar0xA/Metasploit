@@ -29,7 +29,7 @@ class Metasploit3 < Msf::Post
 			[
 				[ 'URL', 'http://jedicorp.com/?p=534' ],
 			],
-			'Platform'	=> ['win', 'linux', 'unix' ],
+			'Platform'	=> ['win', 'linux'],
 			'SessionTypes'	=> ['meterpreter'],
 			'Author'         =>
 			[
